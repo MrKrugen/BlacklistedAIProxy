@@ -23,31 +23,17 @@ import * as http from 'http';
 import * as https from 'https';
 import { configureAxiosProxy, configureTLSSidecar } from '../../utils/proxy-utils.js';
 import { isRetryableNetworkError, MODEL_PROVIDER } from '../../utils/common.js';
+import { PROVIDER_MODELS } from '../provider-models.js';
 
 const LMARENA_HEALTH_TIMEOUT_MS = 5000;
 const LMARENA_REQUEST_TIMEOUT_MS = 120000;
 
-// Models exposed via LMArena. Keep in sync with PROVIDER_MODELS in provider-models.js.
-// These mirror what LMArena typically offers; the bridge auto-routes by model name.
-export const LMARENA_MODELS = [
-    'lmarena-auto',
-    'gpt-5',
-    'gpt-5-mini',
-    'claude-opus-4-7',
-    'claude-opus-4-6',
-    'claude-sonnet-4-6',
-    'claude-opus-4-5',
-    'gemini-3-pro',
-    'gemini-3-flash',
-    'gemini-2.5-pro',
-    'gemini-2.5-flash',
-    'grok-4.20',
-    'grok-3',
-    'deepseek-r2',
-    'llama-4-scout',
-    'llama-4-maverick',
-    'mistral-large-3',
-];
+// Single source of truth for the model list lives in provider-models.js.
+const _lmarenaModels = PROVIDER_MODELS['lmarena-bridge'];
+if (!_lmarenaModels || _lmarenaModels.length === 0) {
+    logger.warn('[LMArena] No models found for lmarena-bridge in PROVIDER_MODELS. Check provider-models.js.');
+}
+export const LMARENA_MODELS = _lmarenaModels || [];
 
 export class LMArenaApiService {
     constructor(config) {
@@ -64,8 +50,8 @@ export class LMArenaApiService {
         this.modelOverride = config.LMARENA_MODEL_OVERRIDE || null;
         this.isInitialized = false;
 
-        const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, timeout: LMARENA_REQUEST_TIMEOUT_MS });
-        const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, timeout: LMARENA_REQUEST_TIMEOUT_MS });
+        const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
+        const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 
         const headers = { 'Content-Type': 'application/json' };
         if (this.apiKey) {
@@ -225,6 +211,19 @@ export class LMArenaApiService {
                     yield JSON.parse(jsonData);
                 } catch {
                     logger.debug('[LMArena] Skipping non-JSON SSE line:', jsonData);
+                }
+            }
+        }
+
+        // Flush any remaining buffer content after the stream ends (no trailing newline case)
+        const remaining = buffer.trim();
+        if (remaining.length > 0 && remaining.startsWith('data: ')) {
+            const jsonData = remaining.substring(6).trim();
+            if (jsonData !== '[DONE]') {
+                try {
+                    yield JSON.parse(jsonData);
+                } catch {
+                    logger.debug('[LMArena] Skipping non-JSON SSE line (flush):', jsonData);
                 }
             }
         }
