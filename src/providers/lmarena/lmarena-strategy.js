@@ -1,11 +1,12 @@
 /**
  * LMArena Provider Strategy
  *
- * Uses the OpenAI protocol strategy since LMArenaBridge exposes a
- * fully OpenAI-compatible /v1/chat/completions endpoint.
+ * LMArenaBridge exposes an OpenAI-compatible /v1/chat/completions
+ * endpoint, so it should use the OpenAI strategy via an `openai-*`
+ * provider type rather than a dedicated `lmarena` protocol strategy.
  *
- * We re-export OpenAIStrategy so the gateway routing layer knows
- * this provider speaks OpenAI protocol.
+ * This module intentionally exports nothing to avoid exposing an
+ * unused alias that is not registered in the provider strategy factory.
  */
 
-export { OpenAIStrategy as LMArenaStrategy } from '../openai/openai-strategy.js';
+export {};
