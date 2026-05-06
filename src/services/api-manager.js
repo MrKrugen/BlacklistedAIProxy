@@ -36,13 +36,10 @@ export async function handleAPIRequests(method, path, req, res, currentConfig, a
         if (geminiUrlPattern.test(path)) endpointType = ENDPOINT_TYPE.GEMINI_CONTENT;
 
         if (endpointType) {
-            return await executeWithFailsafe(async () => {
-                // Apply Sentinel Context Pruning check
-                const sentinel = getSentinel();
-                if (sentinel) {
-                    logger.debug('[Failsafe] Sentinel context monitor active');
-                }
+            // Ensure Sentinel is initialized for context management
+            getSentinel(currentConfig);
 
+            return await executeWithFailsafe(async () => {
                 await handleContentGenerationRequest(req, res, apiService, endpointType, currentConfig, promptLogFilename, providerPoolManager, currentConfig.uuid, path);
                 return true;
             }, { retryCount: 0, maxRetries: currentConfig.maxRetries || 3 });
@@ -61,11 +58,15 @@ async function executeWithFailsafe(action, context) {
         return await action();
     } catch (error) {
         const isRateLimit = error.status === 429 || error.message?.includes('429');
-        const isServerError = error.status >= 500;
+        const isServerError = (error.status >= 500) || error.message?.includes('500') || error.message?.includes('502') || error.message?.includes('503');
 
         if ((isRateLimit || isServerError) && context.retryCount < context.maxRetries) {
             context.retryCount++;
-            logger.warn(`[Super-Failsafe] Error ${error.status || 'unknown'} detected. Attempting retry ${context.retryCount}/${context.maxRetries}`);
+            logger.warn(`[Super-Failsafe] Error ${error.status || 'network'} detected: ${error.message}. Attempting retry ${context.retryCount}/${context.maxRetries}`);
+            
+            // Artificial delay before retry to let provider limits cool down
+            await new Promise(resolve => setTimeout(resolve, 1000 * context.retryCount));
+            
             return await executeWithFailsafe(action, context);
         }
         throw error;
