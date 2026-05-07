@@ -476,6 +476,38 @@ function getPluginHookRequestId(config) {
     return config?._monitorRequestId || config?._pluginRequestId || null;
 }
 
+async function rebuildRequestBodyForProtocolRetry(originalRequestBody, currentRequestBody, fromProvider, targetToProvider, config) {
+    // 使用原始请求作为转换源，避免跨协议重试时叠加转换导致请求体损坏
+    let rebuiltRequestBody = JSON.parse(JSON.stringify(originalRequestBody || {}));
+    const sourceBody = currentRequestBody || {};
+
+    // 保留内部字段（例如 _monitorRequestId / _requestBaseUrl）
+    Object.keys(sourceBody).forEach(key => {
+        if (key.startsWith('_')) {
+            rebuiltRequestBody[key] = sourceBody[key];
+        }
+    });
+
+    if (getProtocolPrefix(fromProvider) !== getProtocolPrefix(targetToProvider)) {
+        rebuiltRequestBody = convertData(rebuiltRequestBody, 'request', fromProvider, targetToProvider);
+
+        // 再次确保内部字段不会在转换过程中丢失
+        Object.keys(sourceBody).forEach(key => {
+            if (key.startsWith('_') && rebuiltRequestBody[key] === undefined) {
+                rebuiltRequestBody[key] = sourceBody[key];
+            }
+        });
+    }
+
+    // 与主流程保持一致：按目标提供商应用系统提示与自定义参数
+    rebuiltRequestBody = await _applySystemPromptFromFile(config, rebuiltRequestBody, targetToProvider);
+    if (config?.customConfig) {
+        _applyCustomModelParameters(rebuiltRequestBody, config.customConfig, targetToProvider);
+    }
+
+    return rebuiltRequestBody;
+}
+
 export async function handleStreamRequest(res, service, model, requestBody, fromProvider, toProvider, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, customName, retryContext = null) {
     let fullResponseText = '';
     let fullResponseJson = '';
@@ -736,6 +768,18 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 
                 if (result && result.service) {
                     logger.info(`[Stream Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
+                    const retryModel = result.actualModel || model;
+                    const retryToProvider = result.actualProviderType || toProvider;
+                    let retryRequestBody = requestBody;
+                    if (getProtocolPrefix(toProvider) !== getProtocolPrefix(retryToProvider)) {
+                        retryRequestBody = await rebuildRequestBodyForProtocolRetry(
+                            retryContext?.originalRequestBody,
+                            requestBody,
+                            fromProvider,
+                            retryToProvider,
+                            CONFIG
+                        );
+                    }
                     
                     // 使用新服务重试
                     const newRetryContext = {
@@ -751,10 +795,10 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     return await handleStreamRequest(
                         res,
                         result.service,
-                        result.actualModel || model,
-                        requestBody,
+                        retryModel,
+                        retryRequestBody,
                         fromProvider,
-                        result.actualProviderType || toProvider,
+                        retryToProvider,
                         PROMPT_LOG_MODE,
                         PROMPT_LOG_FILENAME,
                         providerPoolManager,
@@ -938,6 +982,18 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                 
                 if (result && result.service) {
                     logger.info(`[Unary Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
+                    const retryModel = result.actualModel || model;
+                    const retryToProvider = result.actualProviderType || toProvider;
+                    let retryRequestBody = requestBody;
+                    if (getProtocolPrefix(toProvider) !== getProtocolPrefix(retryToProvider)) {
+                        retryRequestBody = await rebuildRequestBodyForProtocolRetry(
+                            retryContext?.originalRequestBody,
+                            requestBody,
+                            fromProvider,
+                            retryToProvider,
+                            CONFIG
+                        );
+                    }
                     
                     // 使用新服务重试
                     const newRetryContext = {
@@ -951,10 +1007,10 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                     return await handleUnaryRequest(
                         res,
                         result.service,
-                        result.actualModel || model,
-                        requestBody,
+                        retryModel,
+                        retryRequestBody,
                         fromProvider,
-                        result.actualProviderType || toProvider,
+                        retryToProvider,
                         PROMPT_LOG_MODE,
                         PROMPT_LOG_FILENAME,
                         providerPoolManager,
@@ -1275,7 +1331,7 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     // - 凭证切换重试：凭证被标记不健康后切换到其他凭证
     // 当没有不同的健康凭证可用时，重试会自动停止
     const credentialSwitchMaxRetries = CONFIG.CREDENTIAL_SWITCH_MAX_RETRIES || 5;
-    const retryContext = { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries };
+    const retryContext = { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries, originalRequestBody };
     
     if (isStream) {
         await handleStreamRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext);
