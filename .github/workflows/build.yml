@@ -1,0 +1,249 @@
+name: Build BlacklistedAIProxy Installer
+
+on:
+  push:
+    branches: [main, master]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed for gh release create
+
+jobs:
+  build:
+    name: Build Windows x64 Installer
+    runs-on: windows-latest
+
+    steps:
+      # ──────────────────────────────────────────────
+      # 1. Checkout
+      # ──────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────────
+      # 2. Read version from VERSION file
+      # ──────────────────────────────────────────────
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $base = (Get-Content VERSION -Raw).Trim()
+          $full = "$base-beta.1"
+          echo "BASE_VERSION=$base"   >> $env:GITHUB_OUTPUT
+          echo "FULL_VERSION=$full"   >> $env:GITHUB_OUTPUT
+          Write-Host "Building version: $full"
+
+      # ──────────────────────────────────────────────
+      # 3. Set up Go (pins to same major used in batch)
+      # ──────────────────────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: tls-sidecar/go.sum
+
+      # ──────────────────────────────────────────────
+      # 4. Set up Node.js
+      # ──────────────────────────────────────────────
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # ──────────────────────────────────────────────
+      # 5. Install npm dependencies
+      # ──────────────────────────────────────────────
+      - name: Install npm dependencies
+        shell: pwsh
+        run: npm ci --no-optional
+
+      # ──────────────────────────────────────────────
+      # 6. Build tls-sidecar (Go, no CGO)
+      # ──────────────────────────────────────────────
+      - name: Build tls-sidecar
+        shell: pwsh
+        working-directory: tls-sidecar
+        env:
+          CGO_ENABLED: '0'
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          go mod download
+          go build -ldflags="-s -w" -o tls-sidecar.exe .
+          if (-not (Test-Path tls-sidecar.exe)) {
+            Write-Error "tls-sidecar.exe was not produced"
+            exit 1
+          }
+          Write-Host "✓ tls-sidecar.exe built"
+
+      - name: Copy tls-sidecar to root
+        shell: pwsh
+        run: Copy-Item tls-sidecar\tls-sidecar.exe tls-sidecar.exe -Force
+
+      # ──────────────────────────────────────────────
+      # 7. Download NSSM and stage it
+      # ──────────────────────────────────────────────
+      - name: Download and stage NSSM
+        shell: pwsh
+        run: |
+          $nssmDir = "build\nssm"
+          New-Item -ItemType Directory -Force -Path $nssmDir | Out-Null
+
+          $zipPath = "$env:TEMP\nssm.zip"
+          Invoke-WebRequest `
+            -Uri "https://github.com/nssm-community/nssm/releases/download/2.24-101-g897c7ad/nssm-2.24-101-g897c7ad.zip" `
+            -OutFile $zipPath `
+            -UseBasicParsing `
+            -TimeoutSec 60
+
+          Expand-Archive $zipPath -DestinationPath "$env:TEMP\nssm-extract" -Force
+          Copy-Item "$env:TEMP\nssm-extract\nssm-2.24-101-g897c7ad\win64\nssm.exe" `
+                    "$nssmDir\nssm.exe" -Force
+
+          if (-not (Test-Path "$nssmDir\nssm.exe")) {
+            Write-Error "nssm.exe not staged"
+            exit 1
+          }
+          Write-Host "✓ NSSM staged to $nssmDir"
+
+      # ──────────────────────────────────────────────
+      # 8. Download portable Node.js runtime
+      # ──────────────────────────────────────────────
+      - name: Download portable Node.js runtime
+        shell: pwsh
+        run: |
+          $nodeDir = "build\node"
+          New-Item -ItemType Directory -Force -Path $nodeDir | Out-Null
+
+          $zipPath = "$env:TEMP\node.zip"
+          Invoke-WebRequest `
+            -Uri "https://nodejs.org/dist/v20.17.0/node-v20.17.0-win-x64.zip" `
+            -OutFile $zipPath `
+            -UseBasicParsing `
+            -TimeoutSec 120
+
+          Expand-Archive $zipPath -DestinationPath "$env:TEMP\node-extract" -Force
+          Copy-Item "$env:TEMP\node-extract\node-v20.17.0-win-x64\*" `
+                    $nodeDir -Recurse -Force
+
+          Write-Host "✓ Portable Node.js staged to $nodeDir"
+
+      # ──────────────────────────────────────────────
+      # 9. Install Inno Setup
+      # ──────────────────────────────────────────────
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $installer = "$env:TEMP\innosetup.exe"
+          Invoke-WebRequest `
+            -Uri "https://files.jrsoftware.org/is/6/innosetup-6.3.3.exe" `
+            -OutFile $installer `
+            -UseBasicParsing `
+            -TimeoutSec 120
+
+          Start-Process $installer -ArgumentList "/SILENT /SUPPRESSMSGBOXES /SP-" -Wait
+
+          # Verify via PATH (robust — no hardcoded install folder)
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            # Fallback: add default location to PATH for this step
+            $env:PATH += ";C:\Program Files (x86)\Inno Setup 6"
+            $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          }
+          if (-not $iscc) {
+            Write-Error "Inno Setup (iscc.exe) not found after installation"
+            exit 1
+          }
+          Write-Host "✓ Inno Setup ready: $($iscc.Source)"
+          # Persist PATH addition for subsequent steps
+          echo "C:\Program Files (x86)\Inno Setup 6" >> $env:GITHUB_PATH
+
+      # ──────────────────────────────────────────────
+      # 10. Compile installer with Inno Setup
+      # ──────────────────────────────────────────────
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $version      = "${{ steps.version.outputs.FULL_VERSION }}"
+          $versionNum   = "${{ steps.version.outputs.BASE_VERSION }}.1"
+          $issFile      = "installer\BlacklistedProxy.iss"
+
+          New-Item -ItemType Directory -Force -Path Output | Out-Null
+
+          iscc `
+            /D"AppVersion=$version" `
+            /D"AppVersionNumeric=$versionNum" `
+            $issFile
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Inno Setup compilation failed (exit $LASTEXITCODE)"
+            exit 1
+          }
+
+          $installer = "Output\BlacklistedAIProxy-Setup-$version-win-x64.exe"
+          if (-not (Test-Path $installer)) {
+            Write-Error "Expected installer not found: $installer"
+            exit 1
+          }
+
+          $sizeMB = [math]::Round((Get-Item $installer).Length / 1MB, 1)
+          Write-Host "✓ Installer compiled: $sizeMB MB → $installer"
+
+          # Expose path for later steps
+          echo "INSTALLER_PATH=$installer" >> $env:GITHUB_ENV
+          echo "INSTALLER_SIZE_MB=$sizeMB" >> $env:GITHUB_ENV
+
+      # ──────────────────────────────────────────────
+      # 11. Smoke test — silent install + verify runtime
+      # ──────────────────────────────────────────────
+      - name: Smoke test installer
+        shell: pwsh
+        run: |
+          $testDir = "$env:TEMP\BlacklistedAIProxy-Test"
+          if (Test-Path $testDir) { Remove-Item $testDir -Recurse -Force }
+
+          Start-Process $env:INSTALLER_PATH `
+            -ArgumentList "/SILENT /NORESTART /DIR=`"$testDir`" /COMPONENTS=app" `
+            -Wait
+
+          # Check a runtime artifact, not a source file
+          # Adjust the filename below to match what your .iss actually installs
+          $check = "$testDir\BlacklistedAIProxy.exe"
+          if (-not (Test-Path $check)) {
+            Write-Error "Smoke test failed — expected artifact not found: $check"
+            exit 1
+          }
+          Write-Host "✓ Smoke test passed"
+
+      # ──────────────────────────────────────────────
+      # 12. Upload installer as build artifact
+      #     (available on every build, not just releases)
+      # ──────────────────────────────────────────────
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlacklistedAIProxy-Setup-${{ steps.version.outputs.FULL_VERSION }}-win-x64
+          path: ${{ env.INSTALLER_PATH }}
+          retention-days: 30
+
+      # ──────────────────────────────────────────────
+      # 13. Publish GitHub Release (tag pushes only)
+      # ──────────────────────────────────────────────
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = "${{ steps.version.outputs.FULL_VERSION }}"
+          gh release create "v$version" `
+            --prerelease `
+            --title "BlacklistedAIProxy $version" `
+            --notes "Automated beta build v$version" `
+            $env:INSTALLER_PATH
+          Write-Host "✓ Release published: v$version"
